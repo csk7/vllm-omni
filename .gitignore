@@ -248,3 +248,4 @@ vllm_omni/_version.py
 # output files
 *.wav
 sa_open_v1/profiles/*
+sa_open_v1/outputs/*
