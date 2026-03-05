@@ -9,7 +9,7 @@
 **Date:** 2026-03-02
 
 **Model:** `stabilityai/stable-audio-open-1.0`
-**Hardware:** RunPod (NVIDIA GPU, CUDA 12.8)
+**Hardware:** RunPod (NVIDIA GPU 5070, CUDA 12.8)
 **Framework:** vllm-omni 0.1.dev740, vLLM 0.16.0, PyTorch 2.9.1+cu128, diffusers 0.36.0
 
 ### Command
@@ -61,3 +61,7 @@ python text_to_audio.py \
 | # | Change Description | Generation Time | Model Loading Time | Total Wall Time | Notes |
 |---|--------------------|-----------------|-------------------|-----------------|-------|
 | 0 | Baseline           | 3.96s           | 6.08s             | ~112s           | Initial run, no optimizations |
+
+## To-Do
+
+- [ ] Port inference speed-up changes from local repo to `vllm-omni` ([local_repo](https://github.com/csk7/stable-audio-tools/tree/fused_op_v1/inference_speedup)).
