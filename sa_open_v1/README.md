@@ -40,7 +40,7 @@ Detailed explanation of each fusion ops and Cross attention KV caching - ([local
 
 
 ### Future Work - Reduce MM and FA latency for higher overall latency reduction:
-1. Distallation to reduce number of diffusion steps
+1. Distillation to reduce number of diffusion steps
 2. LoRA to reduce parameters
 3. Quantization to FP8, NVFP4
 
