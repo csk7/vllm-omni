@@ -25,17 +25,17 @@ python profiling.py --speedup
 | Sample rate        | 44100 Hz                                       |
 
 ### Goals
-Reduce latency of memory bound operations in Stability audio open models using fusion ops. Baseline latency is 5.3 sec fot 47 sec audio generation. Memory bound ops take about 0.8 secs, Matrix multiply and flash attention take about 85% of the timeleine (4.5 sec). Reduced the 0.8 secs latency in memory bound ops to 0.4 secs (about 50% of memory bound ops latency). The original precision of the ops are maintained.
+Reduce latency of memory bound operations in Stability audio open models using fusion ops. Baseline latency is 5.3 sec for 47 sec audio generation. Memory bound ops take about 0.8 secs, Matrix multiply and flash attention take about 85% of the timeline (4.5 sec). Reduced the 0.8 secs latency in memory bound ops to 0.4 secs (about 50% of memory bound ops latency). The original precision of the ops are maintained.
 
 Detailed explanation of each fusion ops and Cross attention KV caching - ([local_repo](https://github.com/csk7/stable-audio-tools/tree/fused_op_v1/inference_speedup))
 
 
 ### Results
 
-| # | Change Description | Generation Time | Model Loading Time | Total Wall Time | Notes |
-|---|--------------------|-----------------|-------------------|-----------------|-------|
-| 0 | Baseline           | 5.3s           | 6.08s             | ~112s           | Initial run, no optimizations |
-| 1 | Fused ops + Prompt KV Cache           | 4.9s           | 6.08s             | ~111s           | All optimizations in  ([local_repo](https://github.com/csk7/stable-audio-tools/tree/fused_op_v1/inference_speedup))|
+| # | Change Description | Generation Time | Model Loading Time | Notes |
+|---|--------------------|-----------------|-------------------|-------|
+| 0 | Baseline           | 5.3s           | 6.08s             | Initial run, no optimizations |
+| 1 | Fused ops + Prompt KV Cache           | 4.9s           | 6.08s             | All optimizations in  ([local_repo](https://github.com/csk7/stable-audio-tools/tree/fused_op_v1/inference_speedup))|
 
 
 
