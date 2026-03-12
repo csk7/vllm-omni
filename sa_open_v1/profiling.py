@@ -23,11 +23,6 @@ import torch
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
-PROFILING_FLAG = True
-if PROFILING_FLAG:
-    os.environ["VLLM_TORCH_PROFILER_DIR"] = "./profiles"
-    os.environ["VLLM_PROFILER_MAX_ITERS"] = "1"
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate audio with Stable Audio Open.")
     parser.add_argument(
@@ -66,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--audio-length",
         type=float,
-        default=10.0,
+        default=47.0,
         help="Audio length in seconds (max ~47s for stable-audio-open-1.0).",
     )
     parser.add_argument(
@@ -92,6 +87,20 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=44100,
         help="Sample rate for output audio (Stable Audio uses 44100 Hz).",
+    )
+    parser.add_argument(
+        "--speedup",
+        dest="enable_speedup",
+        action="store_true",
+        default=False,
+        help="Enable Stable Audio fused speedups (KV cache + fused kernels).",
+    )
+    parser.add_argument(
+        "--profile",
+        dest="profile",
+        action="store_true",
+        default=False,
+        help="Enable torch profiler (writes traces to ./profiles/).",
     )
     return parser.parse_args()
 
@@ -121,6 +130,12 @@ def save_audio(audio_data: np.ndarray, output_path: str, sample_rate: int = 4410
 
 def main():
     args = parse_args()
+    # Set env vars before Omni() so all worker processes inherit them at fork.
+    if args.enable_speedup:
+        os.environ["SA_ENABLE_SPEEDUP"] = "1"
+    if args.profile:
+        os.environ["VLLM_TORCH_PROFILER_DIR"] = "./profiles"
+        os.environ["VLLM_PROFILER_MAX_ITERS"] = "1"
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
 
     print(f"\n{'=' * 60}")
@@ -133,13 +148,14 @@ def main():
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Guidance scale: {args.guidance_scale}")
     print(f"  Seed: {args.seed}")
+    print(f"  Speedup enabled: {args.enable_speedup}")
+    print(f"  Profiling enabled: {args.profile}")
     print(f"{'=' * 60}\n")
 
     # Initialize Omni with Stable Audio model
     omni = Omni(model=args.model)
 
-    # Check if profiling is requested via environment variable
-    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
+    profiler_enabled = args.profile
 
     # Calculate audio end time
     audio_end_in_s = args.audio_start + args.audio_length

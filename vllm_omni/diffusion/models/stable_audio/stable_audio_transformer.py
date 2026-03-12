@@ -6,6 +6,7 @@ Stable Audio DiT Model for vLLM-Omni.
 """
 
 import math
+import os
 from collections.abc import Iterable
 
 import torch
@@ -19,6 +20,42 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
+
+# Read from env var so worker processes (spawned by Omni) inherit the setting
+# without needing an explicit set_stable_audio_speedup() call in each process.
+ENABLE_SPEEDUP = os.environ.get("SA_ENABLE_SPEEDUP", "0") == "1"
+
+_FUSED_KERNELS_AVAILABLE = False
+try:
+    from vllm_omni.diffusion.kernels.fused_residual_layernorm import (
+        residual_add_layernorm as _fused_residual_add_layernorm,
+    )
+    from vllm_omni.diffusion.kernels.fused_rope import (
+        apply_rope_fused as _fused_apply_rope,
+    )
+    from vllm_omni.diffusion.kernels.fused_swiglu import swiglu as _fused_swiglu
+
+    _FUSED_KERNELS_AVAILABLE = True
+except ImportError:
+    _fused_residual_add_layernorm = None
+    _fused_swiglu = None
+    _fused_apply_rope = None
+
+
+def set_stable_audio_speedup(enabled: bool) -> bool:
+    """Set runtime speedup toggle for Stable Audio transformer kernels."""
+    global ENABLE_SPEEDUP
+    requested = bool(enabled)
+    if requested and not _FUSED_KERNELS_AVAILABLE:
+        ENABLE_SPEEDUP = False
+        logger.warning(
+            "Stable Audio speedup requested, but fused Triton kernels are not "
+            "available. Falling back to original implementation."
+        )
+        return False
+    ENABLE_SPEEDUP = requested
+    logger.info("Stable Audio speedup %s.", "enabled" if ENABLE_SPEEDUP else "disabled")
+    return ENABLE_SPEEDUP
 
 
 def apply_rotary_emb_stable_audio(
@@ -37,6 +74,13 @@ def apply_rotary_emb_stable_audio(
         Tensor with rotary embeddings applied to first rotary_dim dimensions only.
         The remaining dimensions are left unchanged (pass-through).
     """
+    if (
+        ENABLE_SPEEDUP
+        and _FUSED_KERNELS_AVAILABLE
+        and hidden_states.dtype in (torch.float16, torch.bfloat16)
+    ):
+        return _fused_apply_rope(hidden_states, freqs_cis)
+
     cos, sin = freqs_cis  # [S, rotary_dim]
     rotary_dim = cos.shape[-1]
 
@@ -217,30 +261,38 @@ class StableAudioCrossAttention(nn.Module):
         encoder_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
-        encoder_seq_len = encoder_hidden_states.shape[1]
 
-        # Projections
         query, _ = self.to_q(hidden_states)
-        key, _ = self.to_k(encoder_hidden_states)
-        value, _ = self.to_v(encoder_hidden_states)
-
-        # Reshape for multi-head attention
         query = query.view(batch_size, seq_len, self.num_heads, self.head_dim)
-        key = key.view(batch_size, encoder_seq_len, self.num_kv_heads, self.head_dim)
-        value = value.view(batch_size, encoder_seq_len, self.num_kv_heads, self.head_dim)
 
-        # Expand K/V heads to match Q heads for GQA
-        # [B, S, kv_heads, D] -> [B, S, kv_heads, 1, D] -> [B, S, kv_heads, groups, D] -> [B, S, num_heads, D]
-        key = key.unsqueeze(3).expand(-1, -1, -1, self.num_kv_groups, -1)
-        key = key.reshape(batch_size, encoder_seq_len, self.num_heads, self.head_dim)
-        value = value.unsqueeze(3).expand(-1, -1, -1, self.num_kv_groups, -1)
-        value = value.reshape(batch_size, encoder_seq_len, self.num_heads, self.head_dim)
+        cached = getattr(self, "_cross_kv_cached", None)
+        if ENABLE_SPEEDUP and cached is not None:
+            key, value = cached
+        else:
+            encoder_seq_len = encoder_hidden_states.shape[1]
+            key, _ = self.to_k(encoder_hidden_states)
+            value, _ = self.to_v(encoder_hidden_states)
 
-        # Compute attention
+            key = key.view(batch_size, encoder_seq_len, self.num_kv_heads, self.head_dim)
+            value = value.view(
+                batch_size, encoder_seq_len, self.num_kv_heads, self.head_dim
+            )
+
+            key = key.unsqueeze(3).expand(-1, -1, -1, self.num_kv_groups, -1)
+            key = key.reshape(
+                batch_size, encoder_seq_len, self.num_heads, self.head_dim
+            )
+            value = value.unsqueeze(3).expand(-1, -1, -1, self.num_kv_groups, -1)
+            value = value.reshape(
+                batch_size, encoder_seq_len, self.num_heads, self.head_dim
+            )
+
+            if ENABLE_SPEEDUP:
+                self._cross_kv_cached = (key, value)
+
         hidden_states = self.attn(query, key, value)
         hidden_states = hidden_states.view(batch_size, seq_len, self.inner_dim)
 
-        # Output projection
         hidden_states, _ = self.to_out[0](hidden_states)
         hidden_states = self.to_out[1](hidden_states)
 
@@ -256,6 +308,11 @@ class SwiGLU(nn.Module):
         self.activation = nn.SiLU()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if ENABLE_SPEEDUP and _FUSED_KERNELS_AVAILABLE:
+            proj_out = self.proj(hidden_states)
+            if not proj_out.is_contiguous():
+                proj_out = proj_out.contiguous()
+            return _fused_swiglu(proj_out)
         hidden_states = self.proj(hidden_states)
         hidden_states, gate = hidden_states.chunk(2, dim=-1)
         return hidden_states * self.activation(gate)
@@ -331,6 +388,15 @@ class StableAudioDiTBlock(nn.Module):
         attention_mask: torch.Tensor | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if ENABLE_SPEEDUP and _FUSED_KERNELS_AVAILABLE:
+            return self._forward_fused(
+                hidden_states,
+                encoder_hidden_states,
+                rotary_embedding=rotary_embedding,
+                attention_mask=attention_mask,
+                encoder_attention_mask=encoder_attention_mask,
+            )
+
         # Self-attention with skip connection
         residual = hidden_states
         hidden_states = self.norm1(hidden_states)
@@ -355,6 +421,50 @@ class StableAudioDiTBlock(nn.Module):
         hidden_states = residual + hidden_states
 
         return hidden_states
+
+    def _forward_fused(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        rotary_embedding: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
+        encoder_attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Forward with fused residual-add + LayerNorm Triton kernels."""
+        attn_out = self.attn1(
+            self.norm1(hidden_states),
+            rotary_emb=rotary_embedding,
+            attention_mask=attention_mask,
+        )
+        norm2_out, hidden_states = _fused_residual_add_layernorm(
+            hidden_states, attn_out,
+            self.norm2.weight, self.norm2.bias, eps=self.norm2.eps,
+        )
+
+        cross_out = self.attn2(
+            norm2_out,
+            encoder_hidden_states,
+            attention_mask=attention_mask,
+            encoder_attention_mask=encoder_attention_mask,
+        )
+        norm3_out, hidden_states = _fused_residual_add_layernorm(
+            hidden_states, cross_out,
+            self.norm3.weight, self.norm3.bias, eps=self.norm3.eps,
+        )
+
+        hidden_states = hidden_states + self.ff(norm3_out)
+        return hidden_states
+
+
+def clear_cross_kv_cache(model: nn.Module):
+    """Clear cached cross-attention KV tensors from all layers.
+
+    Must be called between diffusion runs when encoder_hidden_states changes
+    (e.g., new prompt).  No-op when ENABLE_SPEEDUP is False.
+    """
+    for module in model.modules():
+        if isinstance(module, StableAudioCrossAttention):
+            module._cross_kv_cached = None
 
 
 class StableAudioDiTModel(nn.Module):
